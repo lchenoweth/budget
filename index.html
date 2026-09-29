@@ -145,8 +145,19 @@ function defaultState(){
       taxRefundExpected: 8000,
       arrearsOwed: 15000,
       houseGoal: 23000,
-      tripGoal: 2500
+      tripGoal: 2500,
+      lastSpendAcct: 'chime',
+      payAcct: 'chime',
+      supportAcct: 'reliacard'
     },
+    accounts: [
+      { id: 'chime', name: 'Chime', start: 0, startDate: '', startTs: 0, setup: false, reconciled: null },
+      { id: 'reliacard', name: 'ReliaCard', start: 0, startDate: '', startTs: 0, setup: false, reconciled: null },
+      { id: 'venmo', name: 'Venmo', start: 0, startDate: '', startTs: 0, setup: false, reconciled: null }
+    ],
+    transfers: [],     // {id, date, ts, from, to, amount, note, status}
+    acctAdj: [],       // {id, acct, date, ts, amount (+/-), note, status}
+    reconHistory: [],  // {id, date, type:'account'|'debt', ref, name, expected, actual, diff, note}
     debts: [
       { id: 'apple', name: 'Apple Card', start: 500 },
       { id: 'nordstrom', name: 'Nordstrom', start: 451 },
@@ -169,7 +180,15 @@ function normalize(obj){
   var d = defaultState();
   var out = Object.assign({}, d, obj || {});
   out.settings = Object.assign({}, d.settings, (obj && obj.settings) || {});
-  ['debts', 'debtEntries', 'transactions', 'income', 'funds', 'checkins'].forEach(function(k){ if (!Array.isArray(out[k])) out[k] = []; });
+  ['debts', 'debtEntries', 'transactions', 'income', 'funds', 'checkins', 'accounts', 'transfers', 'acctAdj', 'reconHistory'].forEach(function(k){ if (!Array.isArray(out[k])) out[k] = []; });
+  // Older backups: give every entry an account and a cleared/pending status.
+  var first = out.accounts[0] ? out.accounts[0].id : '';
+  function st(x){ if (x.status !== 'pending') x.status = 'cleared'; }
+  out.transactions.forEach(function(t){ if (t.acct == null) t.acct = first; st(t); });
+  out.income.forEach(function(i){ if (i.acct == null) i.acct = i.type === 'support' && out.accounts.some(function(a){ return a.id === 'reliacard'; }) ? 'reliacard' : first; st(i); });
+  out.debtEntries.forEach(function(e){ if (e.kind === 'payment' && e.fromAcct == null) e.fromAcct = ''; st(e); });
+  out.funds.forEach(function(f){ if (f.acct == null) f.acct = ''; st(f); });
+  out.transfers.forEach(st); out.acctAdj.forEach(st);
   ['categories', 'debtTargets', 'savingsTargets'].forEach(function(k){ if (!Array.isArray(out.settings[k])) out.settings[k] = d.settings[k]; });
   if (!out.scoreNotes || typeof out.scoreNotes !== 'object') out.scoreNotes = {};
   if (!out.monthBudgets || typeof out.monthBudgets !== 'object') out.monthBudgets = {};
@@ -224,28 +243,93 @@ function catName(id){
   return 'Deleted category';
 }
 
+// Everything that changes a debt's balance: payments, adjustments, and spending charged to that card.
+function debtEvents(debt){
+  var ev = [];
+  S.debtEntries.forEach(function(e){ if (e.debtId === debt.id) ev.push({ date: e.date, delta: e.kind === 'payment' ? -e.amount : e.amount }); });
+  S.transactions.forEach(function(t){ if (t.acct === 'debt:' + debt.id) ev.push({ date: t.date, delta: t.amount }); });
+  return ev.sort(function(a, b){ return a.date < b.date ? -1 : a.date > b.date ? 1 : 0; });
+}
 function debtBalance(debt, asOf){
   var b = +debt.start || 0;
-  S.debtEntries.forEach(function(e){
-    if (e.debtId !== debt.id) return;
-    if (asOf && e.date > asOf) return;
-    b += e.kind === 'payment' ? -e.amount : e.amount;
-  });
+  debtEvents(debt).forEach(function(e){ if (!asOf || e.date <= asOf) b += e.delta; });
   return r2(b);
 }
 function totalDebt(asOf){ return sum(S.debts, function(d){ return Math.max(0, debtBalance(d, asOf)); }); }
 function startingDebt(){ return sum(S.debts, function(d){ return +d.start || 0; }); }
 function debtPaidOffDate(debt){
-  var entries = S.debtEntries.filter(function(e){ return e.debtId === debt.id; }).sort(function(a, b){ return a.date < b.date ? -1 : a.date > b.date ? 1 : 0; });
   var b = +debt.start || 0, paid = null;
-  entries.forEach(function(e){
-    b += e.kind === 'payment' ? -e.amount : e.amount;
+  debtEvents(debt).forEach(function(e){
+    b += e.delta;
     if (r2(b) <= 0 && !paid) paid = e.date;
     if (r2(b) > 0) paid = null;
   });
   return r2(b) <= 0 ? (paid || 'yes') : null;
 }
 function nextDebt(){ return S.debts.filter(function(d){ return debtBalance(d) > 0; })[0] || null; }
+function debtName(id){ var d = S.debts.filter(function(x){ return x.id === id; })[0]; return d ? d.name : 'Removed debt'; }
+// New charges this month: spending put on a card, or a reconciliation posted as "New charge".
+function newCharges(m){
+  var out = [];
+  S.transactions.forEach(function(t){ if (t.acct && t.acct.indexOf('debt:') === 0 && monthOf(t.date) === m) out.push({ name: debtName(t.acct.slice(5)), amount: t.amount, date: t.date }); });
+  S.debtEntries.forEach(function(e){ if (e.kind === 'adjust' && e.reason === 'charge' && monthOf(e.date) === m) out.push({ name: debtName(e.debtId), amount: e.amount, date: e.date }); });
+  return out;
+}
+function chargeWarning(m){
+  var ch = newCharges(m); if (!ch.length) return '';
+  var byCard = {}; ch.forEach(function(c){ byCard[c.name] = r2((byCard[c.name] || 0) + c.amount); });
+  return '<div class="warn">New card charges in ' + monthName(m) + ': ' + Object.keys(byCard).map(function(k){ return esc(k) + ' ' + money(byCard[k]); }).join(', ') +
+    '. This breaks rule 1 (no new carried balances). Pay it off now.</div>';
+}
+
+/* ---------- cash accounts ---------- */
+function acctById(id){ return S.accounts.filter(function(a){ return a.id === id; })[0] || null; }
+function acctName(key){
+  if (!key) return 'Not from these accounts';
+  if (key.indexOf('debt:') === 0) return debtName(key.slice(5)) + ' (card)';
+  var a = acctById(key); return a ? a.name : 'Removed account';
+}
+function inWindow(a, e){
+  if (!a.setup || !a.startDate) return false;
+  if (e.date > a.startDate) return true;
+  if (e.date < a.startDate) return false;
+  return (e.ts || 0) > (a.startTs || 0);
+}
+// Every logged item that moves money in or out of a cash account, since its start.
+function acctItems(a){
+  var items = [];
+  function add(src, e, amt, label){ if (inWindow(a, e)) items.push({ src: src, id: e.id, date: e.date, amount: r2(amt), label: label, status: e.status || 'cleared', note: e.note || '' }); }
+  S.income.forEach(function(i){ if (i.acct === a.id) add('income', i, i.amount, i.type === 'pay' ? 'Paycheck' : i.type === 'support' ? 'Child support' : 'Money in'); });
+  S.transactions.forEach(function(t){ if (t.acct === a.id) add('transactions', t, -t.amount, catName(t.catId)); });
+  S.debtEntries.forEach(function(e){ if (e.kind === 'payment' && e.fromAcct === a.id) add('debtEntries', e, -e.amount, 'Payment to ' + debtName(e.debtId)); });
+  var fnames = { savings: 'Savings', house: 'House fund', trip: 'Trip fund' };
+  S.funds.forEach(function(f){ if (f.acct === a.id) add('funds', f, f.kind === 'withdrawal' ? f.amount : -f.amount, (f.kind === 'withdrawal' ? 'From ' : 'To ') + fnames[f.fund]); });
+  S.transfers.forEach(function(x){
+    if (x.from === a.id) add('transfers', x, -x.amount, 'Transfer to ' + acctName(x.to));
+    if (x.to === a.id) add('transfers', x, x.amount, 'Transfer from ' + acctName(x.from));
+  });
+  S.acctAdj.forEach(function(j){ if (j.acct === a.id) add('acctAdj', j, j.amount, 'Adjustment'); });
+  return items.sort(byDateDesc);
+}
+function acctCalc(a){
+  var items = acctItems(a);
+  var expected = r2((+a.start || 0) + sum(items, function(i){ return i.amount; }));
+  var pending = sum(items.filter(function(i){ return i.status === 'pending'; }), function(i){ return i.amount; });
+  return { items: items, expected: expected, pending: pending, cleared: r2(expected - pending) };
+}
+function acctOptions(sel, withCards, withNone){
+  var h = S.accounts.map(function(a){ return opt(a.id, a.name, a.id === sel); }).join('');
+  if (withCards) h += S.debts.map(function(d){ return opt('debt:' + d.id, 'Card: ' + d.name, 'debt:' + d.id === sel); }).join('');
+  if (withNone) h += opt('', 'Not from these accounts', sel === '');
+  return h;
+}
+function defAcct(pref){ return acctById(pref) ? pref : (S.accounts[0] ? S.accounts[0].id : ''); }
+function lastReconDate(){
+  var d = null;
+  S.reconHistory.forEach(function(r){ if (!d || r.date > d) d = r.date; });
+  S.checkins.forEach(function(c){ if (!d || c.date > d) d = c.date; });
+  return d;
+}
 
 function debtStatus(){
   var cur = totalDebt(), t = today();
@@ -294,7 +378,7 @@ function nextPayday(){
   while (ymd(d) < t && guard++ < 2000) d.setDate(d.getDate() + step);
   return ymd(d);
 }
-function lastCheckin(){ var c = S.checkins.slice().sort(byDateDesc)[0]; return c || null; }
+function lastCheckin(){ var d = lastReconDate(); return d ? { date: d } : null; }
 function checkinDue(){
   var t = today(), last = lastCheckin();
   if (last && last.date === t) return null;
@@ -309,7 +393,7 @@ function toDebtSavingsThisMonth(){
   return r2(pay + sav);
 }
 function nextAction(){
-  if (checkinDue()) return 'Do your weekly check-in.';
+  if (checkinDue()) return 'Do your weekly reconciliation.';
   var over = monthSpending(curMonth()).cats.filter(function(c){ return c.left < 0 && c.id !== '_deleted'; })[0];
   if (over) return 'Stop spending on ' + over.name + '. It is over its limit.';
   var nd = nextDebt(), ds = debtStatus();
@@ -325,9 +409,10 @@ function nextAction(){
 
 /* ---------- UI state ---------- */
 var view = 'home', lastTab = 'home', spendMonth = curMonth(), editTx = null, payOpen = null, lastCat = null;
+var rd = {}; // reconciliation drafts, keyed 'a:<account id>' or 'd:<debt id>'
 var TABS = [['home', 'Home'], ['spending', 'Spending'], ['debt', 'Debt'], ['savings', 'Savings'], ['settings', 'Settings']];
 var SUB = { income: 1, scorecard: 1, checkin: 1, rules: 1 };
-var TITLES = { home: 'Home', spending: 'Spending', debt: 'Debt', savings: 'Savings', settings: 'Settings', income: 'Income', scorecard: 'Monthly scorecard', checkin: 'Weekly check-in', rules: 'Rules' };
+var TITLES = { home: 'Home', spending: 'Spending', debt: 'Debt', savings: 'Savings', settings: 'Settings', income: 'Income', scorecard: 'Monthly scorecard', checkin: 'Reconcile', rules: 'Rules' };
 
 function go(v){
   if (!SUB[v]) lastTab = v;
@@ -357,14 +442,15 @@ function render(){
   var due = checkinDue(), bn = '';
   if (due && view !== 'checkin'){
     var last = lastCheckin();
-    bn = '<div class="banner"><b>' + (due === 'friday' ? 'It\'s Friday. Time for your weekly check-in.' : 'Your check-in is overdue.') + '</b>' +
-      '<div class="small">Update checking, Venmo, and each debt balance. Last check-in: ' + (last ? fmtDate(last.date) : 'never') + '.</div>' +
-      '<div class="btns"><button class="primary" data-act="go" data-v="checkin">Check in now</button></div></div>';
+    bn = '<div class="banner"><b>' + (due === 'friday' ? 'It\'s Friday. Time to reconcile.' : 'Your weekly reconciliation is overdue.') + '</b>' +
+      '<div class="small">Match Chime, ReliaCard, Venmo, and each debt to your apps. Last done: ' + (last ? fmtDate(last.date) : 'never') + '.</div>' +
+      '<div class="btns"><button class="primary" data-act="go" data-v="checkin">Reconcile now</button></div></div>';
   }
   document.getElementById('banner').innerHTML = bn;
-  var fn = { home: vHome, spending: vSpending, debt: vDebt, savings: vSavings, settings: vSettings, income: vIncome, scorecard: vScorecard, checkin: vCheckin, rules: vRules }[view];
+  var fn = { home: vHome, spending: vSpending, debt: vDebt, savings: vSavings, settings: vSettings, income: vIncome, scorecard: vScorecard, checkin: vReconcile, rules: vRules }[view];
   document.getElementById('view').innerHTML = fn();
   if (view === 'savings') toggleSource();
+  if (view === 'spending') toggleCardWarn();
   if (view === 'income') toggleMonth();
 }
 
@@ -374,6 +460,7 @@ function vHome(){
   var ds = debtStatus(), ss = savingsStatus(), sp = monthSpending(m);
   var h = '';
   h += '<section class="card"><div class="label">Next action</div><div class="next">' + esc(nextAction()) + '</div></section>';
+  h += chargeWarning(m);
 
   var dm;
   if (ds.cur <= 0) dm = '<div class="status good">All debt paid off</div>';
@@ -415,8 +502,14 @@ function vHome(){
     '<div class="btns"><button class="primary" data-act="go" data-v="income">Log income</button></div></section>';
 
   var last = lastCheckin();
-  h += '<section class="card"><div class="label">Last check-in</div><div class="next">' + (last ? fmtDate(last.date) : 'Never') + '</div>' +
-    '<div class="btns"><button data-act="go" data-v="checkin">Check in</button><button data-act="go" data-v="scorecard">Scorecard</button><button data-act="go" data-v="rules">Rules</button></div></section>';
+  h += '<section class="card"><div class="label">Accounts</div>' + S.accounts.map(function(a){
+    return '<div class="row"><span><b>' + esc(a.name) + '</b><br><span class="small">' + (a.setup ? 'Last reconciled: ' + (a.reconciled ? fmtDate(a.reconciled) : 'never') : 'Not set up yet') + '</span></span>' +
+      '<span class="r">' + (a.setup ? money(acctCalc(a).expected) : '') + '</span></div>';
+  }).join('') +
+    '<details><summary>Debts last reconciled</summary>' + S.debts.map(function(d){
+      return '<div class="row"><span>' + esc(d.name) + '</span><span class="r small">' + (d.reconciled ? fmtDate(d.reconciled) : 'never') + '</span></div>';
+    }).join('') + '</details>' +
+    '<div class="btns"><button class="primary" data-act="go" data-v="checkin">Reconcile</button><button data-act="go" data-v="scorecard">Scorecard</button><button data-act="go" data-v="rules">Rules</button></div></section>';
   return h;
 }
 
@@ -436,10 +529,13 @@ function vSpending(){
   h += '<form class="card" data-form="tx"><h2>' + (editing ? 'Edit spending' : 'Add spending') + '</h2>' +
     '<label for="txAmt">Amount</label><input id="txAmt" name="amount" inputmode="decimal" autocomplete="off" placeholder="0.00" value="' + (editing ? editing.amount : '') + '">' +
     '<label for="txCat">Category</label><select id="txCat" name="cat">' + cats.map(function(c){ return opt(c.id, c.name, c.id === selCat); }).join('') + '</select>' +
+    '<label for="txAcct">Paid with</label><select id="txAcct" name="acct">' + acctOptions(editing ? editing.acct : defAcct(S.settings.lastSpendAcct), true, false) + '</select>' +
+    '<div id="txCardWarn" class="warn hidden" style="margin-top:8px">Putting this on a card breaks rule 1 unless you pay it off right away.</div>' +
     '<label for="txNote">Note (optional)</label><input id="txNote" name="note" autocomplete="off" value="' + esc(editing ? editing.note : '') + '">' +
     '<label for="txDate">Date</label><input id="txDate" type="date" name="date" value="' + defDate + '">' +
     '<div class="btns"><button class="primary" type="submit">' + (editing ? 'Save changes' : 'Add') + '</button>' + (editing ? '<button type="button" data-act="cancelEdit">Cancel</button>' : '') + '</div></form>';
 
+  h += chargeWarning(m);
   var overs = sp.cats.filter(function(c){ return c.left < 0; });
   overs.forEach(function(c){ h += '<div class="warn">' + esc(c.name) + ' is over its limit by ' + money(-c.left) + '. Stop spending in this category.</div>'; });
 
@@ -452,7 +548,7 @@ function vSpending(){
 
   var list = txIn(m).sort(byDateDesc);
   h += '<section class="card"><h2>Transactions</h2>' + (list.length ? list.map(function(t){
-    return '<div class="item"><span><b>' + esc(catName(t.catId)) + '</b><br><span class="small">' + fmtDate(t.date) + (t.note ? ' · ' + esc(t.note) : '') + '</span></span><b class="r">' + money(t.amount) + '</b>' +
+    return '<div class="item"><span><b>' + esc(catName(t.catId)) + '</b><br><span class="small">' + fmtDate(t.date) + ' · ' + esc(acctName(t.acct)) + (t.note ? ' · ' + esc(t.note) : '') + '</span></span><b class="r">' + money(t.amount) + '</b>' +
       '<div class="acts"><button class="sm" data-act="editTx" data-id="' + t.id + '">Edit</button><button class="sm" data-act="delTx" data-id="' + t.id + '">Delete</button></div></div>';
   }).join('') : '<div class="small">No spending logged for ' + monthName(m) + '.</div>') + '</section>';
   return h;
@@ -463,7 +559,9 @@ function vDebt(){
   var h = '<section class="card"><div class="label">Total debt remaining</div><div class="big">' + money(ds.cur) + '</div>' +
     '<div class="small">Started at ' + money(startingDebt()) + ' · paid down ' + money(Math.max(0, startingDebt() - ds.cur)) + '</div>' +
     (ds.cur <= 0 ? '<div class="status good">All debt paid off</div>' : ds.behind > 0 ? '<div class="status bad">Behind by ' + money(ds.behind) + '</div>' : '<div class="status good">On track</div>') +
-    (nd ? '<div class="next" style="margin-top:8px">Next payment goes to: ' + esc(nd.name) + '</div>' : '') + '</section>';
+    (nd ? '<div class="next" style="margin-top:8px">Next payment goes to: ' + esc(nd.name) + '</div>' : '') +
+    '<div class="btns"><button data-act="go" data-v="checkin">Reconcile with statements</button></div></section>';
+  h += chargeWarning(curMonth());
 
   h += '<section class="card"><h2>Payoff order</h2>';
   S.debts.forEach(function(d, i){
@@ -471,11 +569,12 @@ function vDebt(){
     var entries = S.debtEntries.filter(function(e){ return e.debtId === d.id; }).sort(byDateDesc);
     h += '<div class="item"><span><b>' + (i + 1) + '. ' + esc(d.name) + '</b>' +
       (paid ? '<span class="tag">Paid off' + (paid !== 'yes' ? ' ' + fmtDate(paid) : '') + '</span>' : (nd && nd.id === d.id ? '<span class="tag next">Next</span>' : '')) +
-      '<br><span class="small">Started at ' + money(d.start) + '</span></span><b class="r">' + money(Math.max(0, bal)) + '</b>';
+      '<br><span class="small">Started at ' + money(d.start) + ' · reconciled ' + (d.reconciled ? fmtDate(d.reconciled) : 'never') + '</span></span><b class="r">' + money(Math.max(0, bal)) + '</b>';
     if (payOpen === d.id){
       h += '<form data-form="pay" data-id="' + d.id + '" style="grid-column:1/-1">' +
         '<label>Payment amount</label><input name="amount" inputmode="decimal" autocomplete="off" placeholder="0.00">' +
         '<label>Date</label><input type="date" name="date" value="' + today() + '">' +
+        '<label>Paid from</label><select name="from">' + acctOptions(defAcct(S.settings.payAcct), false, true) + '</select>' +
         '<label>Note (optional)</label><input name="note" autocomplete="off">' +
         '<div class="btns"><button class="primary" type="submit">Save payment</button><button type="button" data-act="togglePay" data-id="' + d.id + '">Cancel</button></div></form>';
     } else if (!paid){
@@ -483,7 +582,7 @@ function vDebt(){
     }
     if (entries.length){
       h += '<details style="grid-column:1/-1"><summary>History (' + entries.length + ')</summary>' + entries.map(function(e){
-        return '<div class="row"><span>' + fmtDate(e.date) + ' · ' + (e.kind === 'payment' ? 'Payment' : 'Balance update') + (e.note ? '<br><span class="small">' + esc(e.note) + '</span>' : '') + '</span>' +
+        return '<div class="row"><span>' + fmtDate(e.date) + ' · ' + (e.kind === 'payment' ? 'Payment' + (e.fromAcct ? ' from ' + esc(acctName(e.fromAcct)) : '') : ({ interest: 'Interest', charge: 'New charge', other: 'Adjustment' }[e.reason] || 'Balance update')) + (e.note ? '<br><span class="small">' + esc(e.note) + '</span>' : '') + '</span>' +
           '<span class="r">' + (e.kind === 'payment' ? '-' + money(e.amount) : (e.amount >= 0 ? '+' : '') + money(e.amount)) + ' <button class="sm" data-act="delDebtEntry" data-id="' + e.id + '">Delete</button></span></div>';
       }).join('') + '</details>';
     }
@@ -511,6 +610,7 @@ function vSavings(){
     '<label for="fKind">Type</label><select id="fKind" name="kind">' + opt('deposit', 'Deposit') + opt('withdrawal', 'Withdrawal') + '</select>' +
     '<div id="srcWrap"><label for="fSrc">House fund source</label><select id="fSrc" name="source">' + opt('refund', 'Tax refund') + opt('arrears', 'Child support arrears') + opt('other', 'Other') + '</select></div>' +
     '<label for="fAmt">Amount</label><input id="fAmt" name="amount" inputmode="decimal" autocomplete="off" placeholder="0.00">' +
+    '<label for="fAcct">Money came from / went to</label><select id="fAcct" name="acct">' + acctOptions(defAcct(S.settings.payAcct), false, true) + '</select>' +
     '<label for="fDate">Date</label><input id="fDate" type="date" name="date" value="' + today() + '">' +
     '<label for="fNote">Note (optional)</label><input id="fNote" name="note" autocomplete="off">' +
     '<div class="btns"><button class="primary" type="submit">Save</button></div></form>';
@@ -537,11 +637,12 @@ function vSavings(){
   var names = { savings: 'Savings', house: 'House fund', trip: 'Trip fund' }, srcs = { refund: 'tax refund', arrears: 'arrears', other: 'other' };
   var list = S.funds.slice().sort(byDateDesc);
   h += '<section class="card"><h2>History</h2>' + (list.length ? list.map(function(f){
-    return '<div class="item"><span><b>' + names[f.fund] + '</b> · ' + (f.kind === 'withdrawal' ? 'Withdrawal' : 'Deposit') + '<br><span class="small">' + fmtDate(f.date) + (f.fund === 'house' && f.source ? ' · ' + srcs[f.source] : '') + (f.note ? ' · ' + esc(f.note) : '') + '</span></span>' +
+    return '<div class="item"><span><b>' + names[f.fund] + '</b> · ' + (f.kind === 'withdrawal' ? 'Withdrawal' : 'Deposit') + '<br><span class="small">' + fmtDate(f.date) + (f.fund === 'house' && f.source ? ' · ' + srcs[f.source] : '') + (f.acct ? ' · ' + esc(acctName(f.acct)) : '') + (f.note ? ' · ' + esc(f.note) : '') + '</span></span>' +
       '<b class="r">' + (f.kind === 'withdrawal' ? '-' : '+') + money(f.amount) + '</b><div class="acts"><button class="sm" data-act="delFund" data-id="' + f.id + '">Delete</button></div></div>';
   }).join('') : '<div class="small">Nothing logged yet.</div>') + '</section>';
   return h;
 }
+function toggleCardWarn(){ var s = document.getElementById('txAcct'), w = document.getElementById('txCardWarn'); if (s && w) w.className = s.value.indexOf('debt:') === 0 ? 'warn' : 'warn hidden'; }
 function toggleSource(){ var f = document.getElementById('fFund'), w = document.getElementById('srcWrap'); if (f && w) w.className = f.value === 'house' ? '' : 'hidden'; }
 
 function vIncome(){
@@ -550,7 +651,8 @@ function vIncome(){
   var months = monthsRange(addMonths(cur, -6), addMonths(cur, 1));
   var h = backBtn();
   h += '<form class="card" data-form="inc"><h2>Log income</h2>' +
-    '<label for="iType">Type</label><select id="iType" name="type">' + opt('pay', 'Paycheck') + opt('support', 'Child support') + '</select>' +
+    '<label for="iType">Type</label><select id="iType" name="type">' + opt('pay', 'Paycheck') + opt('support', 'Child support') + opt('other', 'Other money in') + '</select>' +
+    '<label for="iAcct">Deposited to</label><select id="iAcct" name="acct">' + acctOptions(defAcct(S.settings.payAcct), false, false) + '</select>' +
     '<label for="iAmt">Amount</label><input id="iAmt" name="amount" inputmode="decimal" autocomplete="off" placeholder="0.00" data-lastpay="' + (lastPay ? lastPay.amount : '') + '" value="' + (lastPay ? lastPay.amount : '') + '">' +
     '<label for="iDate">Date received</label><input id="iDate" type="date" name="date" value="' + today() + '">' +
     '<div id="monthWrap"><label for="iMonth">Support for which month</label><select id="iMonth" name="month">' + months.map(function(m){ return opt(m, monthName(m), m === cur); }).join('') + '</select></div>' +
@@ -567,7 +669,7 @@ function vIncome(){
 
   var list = S.income.slice().sort(byDateDesc);
   h += '<section class="card"><h2>Income history</h2>' + (list.length ? list.map(function(i){
-    return '<div class="item"><span><b>' + (i.type === 'pay' ? 'Paycheck' : 'Child support') + '</b><br><span class="small">' + fmtDate(i.date) + (i.type === 'support' ? ' · for ' + monthName(i.month, true) : '') + (i.note ? ' · ' + esc(i.note) : '') + '</span></span>' +
+    return '<div class="item"><span><b>' + ({ pay: 'Paycheck', support: 'Child support' }[i.type] || 'Other money in') + '</b><br><span class="small">' + fmtDate(i.date) + ' · ' + esc(acctName(i.acct)) + (i.type === 'support' ? ' · for ' + monthName(i.month, true) : '') + (i.note ? ' · ' + esc(i.note) : '') + '</span></span>' +
       '<b class="r">' + money(i.amount) + '</b><div class="acts"><button class="sm" data-act="delInc" data-id="' + i.id + '">Delete</button></div></div>';
   }).join('') : '<div class="small">Nothing logged yet.</div>') + '</section>';
   return h;
@@ -594,26 +696,116 @@ function vScorecard(){
   return h;
 }
 
-function vCheckin(){
-  var last = lastCheckin();
-  var h = backBtn() + '<section class="card"><div class="label">Last check-in</div><div class="next">' + (last ? fmtDate(last.date) : 'Never') + '</div>' +
-    (last ? '<div class="small">Checking ' + money(last.checking) + (last.venmo != null ? ' · Venmo ' + money(last.venmo) : '') + ' · Debt ' + money(last.totalDebt) + '</div>' : '') + '</section>';
-  h += '<form class="card" data-form="checkin"><h2>Update balances</h2>' +
-    '<label for="cChk">Checking balance</label><input id="cChk" name="checking" inputmode="decimal" autocomplete="off" placeholder="0.00">' +
-    '<label for="cVen">Venmo balance</label><input id="cVen" name="venmo" inputmode="decimal" autocomplete="off" placeholder="0.00">';
-  S.debts.forEach(function(d){
-    var bal = Math.max(0, debtBalance(d));
-    h += '<label for="cd_' + d.id + '">' + esc(d.name) + ' balance' + (bal <= 0 ? ' (paid off)' : '') + '</label><input id="cd_' + d.id + '" name="d_' + d.id + '" inputmode="decimal" autocomplete="off" value="' + bal + '">';
-  });
-  h += '<div class="small" style="margin-top:8px">If a debt balance here differs from the app, the app records a balance update.</div>' +
-    '<div class="btns"><button class="primary" type="submit">Save check-in</button></div></form>';
-  var list = S.checkins.slice().sort(byDateDesc).slice(0, 12);
-  if (list.length){
-    h += '<section class="card"><h2>Past check-ins</h2><div class="tablewrap"><table><tr><th>Date</th><th>Checking</th><th>Venmo</th><th>Debt</th></tr>' +
-      list.map(function(c){ return '<tr><td>' + fmtDate(c.date) + '</td><td>' + money(c.checking) + '</td><td>' + (c.venmo == null ? '—' : money(c.venmo)) + '</td><td>' + money(c.totalDebt) + '</td></tr>'; }).join('') +
-      '</table></div></section>';
+function vReconcile(){
+  var last = lastCheckin(), h = backBtn();
+  h += '<section class="card"><div class="label">Last reconciled</div><div class="next">' + (last ? fmtDate(last.date) : 'Never') + '</div>' +
+    '<div class="small">Open each app, type in the balance it shows, and fix any difference until it reads $0.</div></section>';
+  h += '<h2 style="margin:18px 0 8px">Cash accounts</h2>';
+  S.accounts.forEach(function(a){ h += acctReconCard(a); });
+  if (S.accounts.length > 1){
+    h += '<section class="card"><details><summary>Move money between accounts</summary><form data-form="xfer">' +
+      '<label>From</label><select name="from">' + acctOptions(S.accounts[S.accounts.length - 1].id, false, false) + '</select>' +
+      '<label>To</label><select name="to">' + acctOptions(S.accounts[0].id, false, false) + '</select>' +
+      '<label>Amount</label><input name="amount" inputmode="decimal" autocomplete="off" placeholder="0.00">' +
+      '<label>Date</label><input type="date" name="date" value="' + today() + '">' +
+      '<label>Note (optional)</label><input name="note" autocomplete="off">' +
+      '<div class="btns"><button class="primary" type="submit">Save transfer</button></div></form></details></section>';
+  }
+  h += '<h2 style="margin:18px 0 8px">Debts</h2>';
+  S.debts.forEach(function(d){ h += debtReconCard(d); });
+
+  var hist = S.reconHistory.slice().sort(function(a, b){ return a.date < b.date ? 1 : a.date > b.date ? -1 : (b.ts || 0) - (a.ts || 0); }).slice(0, 40);
+  h += '<section class="card"><h2>History</h2>' + (hist.length ? '<div class="tablewrap"><table><tr><th>Date</th><th>Account</th><th>Expected</th><th>Actual</th><th>Diff</th></tr>' +
+    hist.map(function(r){
+      return '<tr><td>' + fmtDate(r.date) + '</td><td>' + esc(r.name) + '</td><td>' + money(r.expected) + '</td><td>' + money(r.actual) + '</td><td>' + (r.diff > 0 ? '+' : '') + money(r.diff) + '</td></tr>' +
+        (r.note ? '<tr><td class="note small" colspan="5">' + esc(r.note) + '</td></tr>' : '');
+    }).join('') + '</table></div>' : '<div class="small">Nothing reconciled yet.</div>') + '</section>';
+
+  if (S.checkins.length){
+    h += '<section class="card"><details><summary>Earlier check-ins</summary><div class="tablewrap"><table><tr><th>Date</th><th>Checking</th><th>Venmo</th><th>Debt</th></tr>' +
+      S.checkins.slice().sort(byDateDesc).map(function(c){ return '<tr><td>' + fmtDate(c.date) + '</td><td>' + money(c.checking) + '</td><td>' + (c.venmo == null ? '—' : money(c.venmo)) + '</td><td>' + money(c.totalDebt) + '</td></tr>'; }).join('') +
+      '</table></div></details></section>';
   }
   return h;
+}
+
+function acctReconCard(a){
+  var key = 'a:' + a.id, t = today();
+  var h = '<section class="card"><h2>' + esc(a.name) + '</h2>';
+  if (!a.setup){
+    return h + '<div class="small">Enter the balance your ' + esc(a.name) + ' app shows right now. The app tracks it from here.</div>' +
+      '<form data-form="asetup" data-id="' + a.id + '"><label>Current balance</label><input name="actual" inputmode="decimal" autocomplete="off" placeholder="0.00">' +
+      '<div class="btns"><button class="primary" type="submit">Set up ' + esc(a.name) + '</button></div></form></section>';
+  }
+  var c = acctCalc(a), d = rd[key];
+  h += '<div class="small">Last reconciled: ' + (a.reconciled ? fmtDate(a.reconciled) : 'never') + '</div>' +
+    '<div class="row"><span>Expected (everything logged)</span><span class="r">' + money(c.expected) + '</span></div>';
+  if (c.pending) h += '<div class="row"><span>Pending, not in bank yet</span><span class="r">' + (c.pending > 0 ? '+' : '') + money(c.pending) + '</span></div>' +
+    '<div class="row"><span><b>Should match your app</b></span><span class="r"><b>' + money(c.cleared) + '</b></span></div>';
+  if (!d){
+    return h + '<form data-form="acmp" data-id="' + a.id + '"><label>Actual balance in your ' + esc(a.name) + ' app</label><input name="actual" inputmode="decimal" autocomplete="off" placeholder="0.00">' +
+      '<div class="btns"><button class="primary" type="submit">Compare</button></div></form></section>';
+  }
+  var diff = r2(d.actual - c.cleared);
+  h += '<div class="row"><span>Actual</span><span class="r">' + money(d.actual) + '</span></div>' +
+    '<div class="row"><span><b>Difference</b></span><span class="r"><b>' + (diff > 0 ? '+' : '') + money(diff) + '</b></span></div>';
+  if (Math.abs(diff) < 0.005){
+    return h + '<div class="status good">Balanced</div><form data-form="arecon" data-id="' + a.id + '"><label>Note (optional)</label><input name="note" autocomplete="off">' +
+      '<div class="btns"><button class="primary" type="submit">Mark reconciled</button><button type="button" data-act="rdCancel" data-k="' + key + '">Cancel</button></div></form></section>';
+  }
+  h += '<div class="warn" style="margin-top:10px">Off by ' + money(Math.abs(diff)) + '. Your ' + esc(a.name) + ' app shows ' + (diff > 0 ? 'more' : 'less') + ' than expected.</div>' +
+    '<div class="small">Try these in order: mark anything your bank has not posted yet as Pending, add anything you forgot to log, then post an adjustment for whatever is left.</div>';
+  var since = a.reconciled || a.startDate;
+  var list = c.items.filter(function(i){ return i.status === 'pending' || i.date >= since; }).slice(0, 40);
+  h += '<details open><summary>Cleared or pending (' + list.length + ')</summary>' + (list.length ? list.map(function(i){
+    function b(s, label){ return '<button class="sm' + (i.status === s ? ' primary' : '') + '" data-act="setStatus" data-k="' + key + '" data-src="' + i.src + '" data-id="' + i.id + '" data-s="' + s + '">' + label + '</button>'; }
+    return '<div class="item"><span>' + esc(i.label) + '<br><span class="small">' + fmtDate(i.date) + (i.note ? ' · ' + esc(i.note) : '') + '</span></span><b class="r">' + (i.amount > 0 ? '+' : '') + money(i.amount) + '</b>' +
+      '<div class="acts">' + b('cleared', 'Cleared') + b('pending', 'Pending') + '</div></div>';
+  }).join('') : '<div class="small">Nothing logged since the last reconciliation.</div>') + '</details>';
+  h += '<details><summary>Add a missing transaction</summary><form data-form="amiss" data-id="' + a.id + '">' +
+    '<label>Type</label><select name="type">' + opt('out', 'Money out (spending)') + opt('in', 'Money in') + '</select>' +
+    '<label>Amount</label><input name="amount" inputmode="decimal" autocomplete="off" placeholder="0.00">' +
+    '<div class="mcat"><label>Category</label><select name="cat">' + S.settings.categories.map(function(x){ return opt(x.id, x.name); }).join('') + '</select></div>' +
+    '<label>Date</label><input type="date" name="date" value="' + t + '">' +
+    '<label>Note (optional)</label><input name="note" autocomplete="off">' +
+    '<div class="btns"><button class="primary" type="submit">Add</button></div></form></details>';
+  h += '<details><summary>Post an adjustment</summary><form data-form="aadj" data-id="' + a.id + '">' +
+    '<label>Direction</label><select name="dir">' + opt('add', 'Add to the app balance', diff > 0) + opt('sub', 'Subtract from the app balance', diff < 0) + '</select>' +
+    '<label>Amount</label><input name="amount" inputmode="decimal" autocomplete="off" value="' + Math.abs(diff) + '">' +
+    '<label>Note</label><input name="note" autocomplete="off" placeholder="What was this? (required)">' +
+    '<div class="btns"><button class="primary" type="submit">Post adjustment</button></div></form></details>' +
+    '<div class="btns"><button type="button" data-act="rdCancel" data-k="' + key + '">Start over</button></div>';
+  return h + '</section>';
+}
+
+function debtReconCard(d){
+  var key = 'd:' + d.id, bal = debtBalance(d), dr = rd[key];
+  var h = '<section class="card"><h2>' + esc(d.name) + '</h2><div class="small">Last reconciled: ' + (d.reconciled ? fmtDate(d.reconciled) : 'never') + '</div>' +
+    '<div class="row"><span>Tracked balance</span><span class="r">' + money(bal) + '</span></div>';
+  if (!dr){
+    return h + '<form data-form="dcmp" data-id="' + d.id + '"><label>Actual statement or current balance</label><input name="actual" inputmode="decimal" autocomplete="off" placeholder="0.00">' +
+      '<div class="btns"><button class="primary" type="submit">Compare</button></div></form></section>';
+  }
+  var diff = r2(dr.actual - bal);
+  h += '<div class="row"><span>Actual</span><span class="r">' + money(dr.actual) + '</span></div>' +
+    '<div class="row"><span><b>Difference</b></span><span class="r"><b>' + (diff > 0 ? '+' : '') + money(diff) + '</b></span></div>';
+  if (Math.abs(diff) < 0.005){
+    return h + '<div class="status good">Matches</div><form data-form="drecon" data-id="' + d.id + '"><label>Note (optional)</label><input name="note" autocomplete="off">' +
+      '<div class="btns"><button class="primary" type="submit">Mark reconciled</button><button type="button" data-act="rdCancel" data-k="' + key + '">Cancel</button></div></form></section>';
+  }
+  h += '<form data-form="dpost" data-id="' + d.id + '">';
+  if (diff > 0){
+    h += '<div class="small" style="margin-top:8px">The card shows ' + money(diff) + ' more than the app. This is usually interest or a new charge.</div>' +
+      '<label>Post the difference as</label><select name="reason" data-cw="' + d.id + '">' + opt('interest', 'Interest') + opt('charge', 'New charge') + opt('other', 'Other adjustment') + '</select>' +
+      '<div id="cw_' + d.id + '" class="warn hidden" style="margin-top:8px">A new charge breaks rule 1: no new carried card balances. Pay it off right away.</div>';
+  } else {
+    h += '<div class="small" style="margin-top:8px">The card shows ' + money(-diff) + ' less than the app. This is usually a payment you have not logged, or a refund.</div>' +
+      '<label>Post the difference as</label><select name="reason" data-pf="' + d.id + '">' + opt('payment', 'A payment I did not log') + opt('other', 'Other adjustment (refund or credit)') + '</select>' +
+      '<div id="pf_' + d.id + '"><label>Paid from</label><select name="from">' + acctOptions(defAcct(S.settings.payAcct), false, true) + '</select></div>';
+  }
+  h += '<label>Note (optional)</label><input name="note" autocomplete="off">' +
+    '<div class="btns"><button class="primary" type="submit">Post ' + (diff > 0 ? '+' : '-') + money(Math.abs(diff)) + '</button><button type="button" data-act="rdCancel" data-k="' + key + '">Cancel</button></div></form>';
+  return h + '</section>';
 }
 
 function vRules(){
@@ -649,6 +841,14 @@ function vSettings(){
     numField('Child support per month', 'settings.childSupportMonthly', s.childSupportMonthly) +
     '<label>Track missed support starting (YYYY-MM)</label><input data-bind="settings.supportStartMonth" data-type="month" value="' + esc(s.supportStartMonth) + '">' +
     '</section>';
+
+  h += '<section class="card"><h2>Cash accounts</h2><div class="small">Starting balance is what the account held at the start of the start date. The easiest way to set one up is from the Reconcile screen.</div>' +
+    S.accounts.map(function(a, i){
+      return '<div class="editrow"><input aria-label="Account name" data-bind="accounts.' + i + '.name" data-type="text" value="' + esc(a.name) + '">' +
+        '<input aria-label="Starting balance for ' + esc(a.name) + '" inputmode="decimal" data-bind="accounts.' + i + '.start" data-type="num" value="' + (a.start || 0) + '">' +
+        '<div class="full-row"><label style="margin:0">Start date</label><input type="date" style="flex:1" aria-label="Start date for ' + esc(a.name) + '" data-bind="accounts.' + i + '.startDate" data-type="text" value="' + esc(a.startDate) + '">' +
+        '<button class="sm" data-act="delAcct" data-i="' + i + '">Remove</button></div></div>';
+    }).join('') + '<div class="btns"><button data-act="addAcct">Add account</button></div></section>';
 
   h += '<section class="card"><h2>Monthly plan</h2>' +
     numField('Amount going to debt or savings each month', 'settings.planToDebtSavings', s.planToDebtSavings) +
@@ -735,6 +935,24 @@ document.addEventListener('click', function(e){
     save(); return render();
   }
   if (a === 'delTarget'){ S.settings[el.dataset.k].splice(i, 1); save(); return render(); }
+  if (a === 'setStatus'){
+    var arr = S[el.dataset.src], it = arr && arr[findIdx(arr, id)];
+    if (it && it.status !== el.dataset.s){
+      var dft = rd[el.dataset.k];
+      if (dft){ dft.marks = dft.marks || {}; if (!dft.marks[id]) dft.marks[id] = { from: it.status, amount: it.amount }; }
+      it.status = el.dataset.s;
+      if (dft) dft.marks[id].to = it.status;
+      save();
+    }
+    return render();
+  }
+  if (a === 'rdCancel'){ delete rd[el.dataset.k]; return render(); }
+  if (a === 'addAcct'){ S.accounts.push({ id: uid(), name: 'New account', start: 0, startDate: '', startTs: 0, setup: false, reconciled: null }); save(); return render(); }
+  if (a === 'delAcct'){
+    var ac = S.accounts[i];
+    if (confirm('Remove "' + ac.name + '"? Entries already logged to it stay, but it will no longer be reconciled.')){ S.accounts.splice(i, 1); save(); render(); }
+    return;
+  }
   if (a === 'export') return exportBackup();
   if (a === 'copyBackup') return copyBackup();
   if (a === 'importFile'){ var f = document.getElementById('importFile'); f.value = ''; f.click(); return; }
@@ -749,8 +967,14 @@ document.addEventListener('click', function(e){
 document.addEventListener('change', function(e){
   var el = e.target;
   if (el.id === 'fFund') return toggleSource();
+  if (el.id === 'txAcct') return toggleCardWarn();
+  if (el.dataset && el.dataset.cw){ var cw = document.getElementById('cw_' + el.dataset.cw); if (cw) cw.className = el.value === 'charge' ? 'warn' : 'warn hidden'; return; }
+  if (el.dataset && el.dataset.pf){ var pf = document.getElementById('pf_' + el.dataset.pf); if (pf) pf.className = el.value === 'payment' ? '' : 'hidden'; return; }
+  if (el.name === 'type' && el.form && el.form.dataset.form === 'amiss'){ var mc = el.form.querySelector('.mcat'); if (mc) mc.className = el.value === 'out' ? 'mcat' : 'mcat hidden'; return; }
   if (el.id === 'iType'){
     toggleMonth();
+    var ia = document.getElementById('iAcct');
+    if (ia) ia.value = defAcct(el.value === 'support' ? S.settings.supportAcct : S.settings.payAcct);
     var amt = document.getElementById('iAmt');
     if (amt){ if (el.value === 'support' && amt.value === amt.dataset.lastpay) amt.value = ''; else if (el.value === 'pay' && !amt.value) amt.value = amt.dataset.lastpay; }
     return;
@@ -780,6 +1004,13 @@ document.addEventListener('change', function(e){
     }
     setPath(path, v);
     if (path.indexOf('settings.categories') === 0) snapshotCurrent();
+    var am = path.match(/^accounts\.(\d+)\.(start|startDate)$/);
+    if (am){
+      var ac2 = S.accounts[+am[1]];
+      if (am[2] === 'startDate') ac2.startTs = 0;
+      else if (!ac2.startDate){ ac2.startDate = today(); ac2.startTs = Date.now(); }
+      ac2.setup = true;
+    }
     save();
     var tot = document.getElementById('catTotal');
     if (tot) tot.textContent = money(sum(S.settings.categories, function(c){ return +c.budget || 0; }));
@@ -798,18 +1029,22 @@ document.addEventListener('submit', function(e){
   var date = f.date && f.date.value ? f.date.value : today();
   var note = f.note ? f.note.value.trim() : '';
 
+  var now = Date.now(), t = today();
+
   if (kind === 'tx'){
     if (isNaN(amt) || amt === 0) return toast('Enter an amount.');
-    var catId = f.cat.value; lastCat = catId;
+    var catId = f.cat.value, acct = f.acct.value; lastCat = catId;
+    if (acct.indexOf('debt:') !== 0) S.settings.lastSpendAcct = acct;
     if (editTx){
       var tx = S.transactions[findIdx(S.transactions, editTx)];
-      if (tx){ tx.amount = amt; tx.catId = catId; tx.date = date; tx.note = note; }
+      if (tx){ tx.amount = amt; tx.catId = catId; tx.date = date; tx.note = note; tx.acct = acct; }
       editTx = null;
-    } else S.transactions.push({ id: uid(), date: date, amount: amt, catId: catId, note: note });
+    } else S.transactions.push({ id: uid(), ts: now, date: date, amount: amt, catId: catId, note: note, acct: acct, status: 'cleared' });
     save();
     spendMonth = monthOf(date);
     var st = monthSpending(spendMonth).cats.filter(function(c){ return c.id === catId; })[0];
     render();
+    if (acct.indexOf('debt:') === 0) return toast('Saved on ' + acctName(acct) + '. Rule 1: pay it off right away.');
     toast(st && st.left < 0 ? 'Saved. ' + st.name + ' is over its limit.' : 'Saved.' + (st ? ' ' + money(st.left) + ' left in ' + st.name + '.' : ''));
     return;
   }
@@ -817,7 +1052,7 @@ document.addEventListener('submit', function(e){
     if (!(amt > 0)) return toast('Enter a payment amount.');
     var d = S.debts[findIdx(S.debts, f.dataset.id)], bal = debtBalance(d);
     if (amt > bal && !confirm('That is more than the ' + money(bal) + ' balance. Save anyway?')) return;
-    S.debtEntries.push({ id: uid(), debtId: d.id, date: date, kind: 'payment', amount: amt, note: note });
+    S.debtEntries.push({ id: uid(), ts: now, debtId: d.id, date: date, kind: 'payment', amount: amt, note: note, fromAcct: f.from.value, status: 'cleared' });
     save(); payOpen = null; render();
     toast(debtBalance(d) <= 0 ? d.name + ' is paid off.' : 'Payment saved. ' + money(debtBalance(d)) + ' left on ' + d.name + '.');
     return;
@@ -826,38 +1061,107 @@ document.addEventListener('submit', function(e){
     if (!(amt > 0)) return toast('Enter an amount.');
     var fund = f.fund.value, fk = f.kind.value;
     if (fk === 'withdrawal' && amt > fundBal(fund) && !confirm('That is more than the fund balance. Save anyway?')) return;
-    S.funds.push({ id: uid(), fund: fund, kind: fk, amount: amt, date: date, source: fund === 'house' ? f.source.value : '', note: note });
+    S.funds.push({ id: uid(), ts: now, fund: fund, kind: fk, amount: amt, date: date, source: fund === 'house' ? f.source.value : '', note: note, acct: f.acct.value, status: 'cleared' });
     save(); render(); toast('Saved.');
     return;
   }
   if (kind === 'inc'){
     if (!(amt > 0)) return toast('Enter an amount.');
-    var type = f.type.value;
-    S.income.push({ id: uid(), date: date, type: type, amount: amt, month: type === 'support' ? f.month.value : monthOf(date), note: note });
+    var type = f.type.value, iacct = f.acct.value;
+    if (type === 'pay') S.settings.payAcct = iacct;
+    if (type === 'support') S.settings.supportAcct = iacct;
+    S.income.push({ id: uid(), ts: now, date: date, type: type, amount: amt, month: type === 'support' ? f.month.value : monthOf(date), note: note, acct: iacct, status: 'cleared' });
     save(); render();
     if (type === 'support'){
       var got = supportFor(f.month.value), exp = +S.settings.childSupportMonthly || 0;
       toast(got < exp ? 'Saved. ' + money(exp - got) + ' still short for ' + monthName(f.month.value) + '.' : 'Saved. Support for ' + monthName(f.month.value) + ' is paid in full. Move the goal amount today.');
-    } else toast('Paycheck saved.');
+    } else toast('Saved.');
     return;
   }
-  if (kind === 'checkin'){
-    var chk = num(f.checking.value), ven = f.venmo.value.trim() === '' ? null : num(f.venmo.value);
-    if (isNaN(chk)) return toast('Enter your checking balance.');
-    if (ven !== null && isNaN(ven)) return toast('Check the Venmo balance.');
-    var t = today(), balances = {};
-    for (var k = 0; k < S.debts.length; k++){
-      var db = S.debts[k], inp = f['d_' + db.id];
-      if (!inp || inp.value.trim() === '') continue;
-      var nb = num(inp.value);
-      if (isNaN(nb) || nb < 0) return toast('Check the ' + db.name + ' balance.');
-      var delta = r2(nb - Math.max(0, debtBalance(db)));
-      if (Math.abs(delta) >= 0.01) S.debtEntries.push({ id: uid(), debtId: db.id, date: t, kind: 'adjust', amount: delta, note: 'Weekly check-in' });
-      balances[db.id] = nb;
+
+  /* reconciliation */
+  var a = acctById(f.dataset.id), key = 'a:' + f.dataset.id;
+  function logFix(k, text){ if (rd[k]) rd[k].fixes.push(text); }
+  function history(type, ref, name, expected, actual, diff, hnote){
+    S.reconHistory.push({ id: uid(), ts: now, date: t, type: type, ref: ref, name: name, expected: r2(expected), actual: r2(actual), diff: r2(diff), note: hnote });
+  }
+  if (kind === 'asetup'){
+    var v = num(f.actual.value); if (isNaN(v)) return toast('Enter the balance from your app.');
+    a.start = v; a.startDate = t; a.startTs = now; a.setup = true; a.reconciled = t;
+    history('account', a.id, a.name, v, v, 0, 'Starting balance set');
+    save(); render(); toast(a.name + ' is set up.');
+    return;
+  }
+  if (kind === 'acmp'){
+    var act = num(f.actual.value); if (isNaN(act)) return toast('Enter the balance from your app.');
+    var c = acctCalc(a);
+    rd[key] = { actual: act, expected0: c.cleared, diff0: r2(act - c.cleared), fixes: [] };
+    render(); return;
+  }
+  if (kind === 'arecon'){
+    var dr = rd[key]; if (!dr) return;
+    var parts = [];
+    Object.keys(dr.marks || {}).forEach(function(mid){ var mk = dr.marks[mid]; if (mk.to !== mk.from) parts.push('Marked ' + money(Math.abs(mk.amount)) + ' ' + mk.to); });
+    parts = parts.concat(dr.fixes); if (note) parts.push(note);
+    history('account', a.id, a.name, dr.expected0, dr.actual, dr.diff0, parts.join('; '));
+    a.reconciled = t; delete rd[key];
+    save(); render(); toast(a.name + ' reconciled.');
+    return;
+  }
+  if (kind === 'amiss'){
+    if (!(amt > 0)) return toast('Enter an amount.');
+    if (f.type.value === 'out'){
+      S.transactions.push({ id: uid(), ts: now, date: date, amount: amt, catId: f.cat.value, note: note, acct: a.id, status: 'cleared' });
+      logFix(key, 'Added missing ' + catName(f.cat.value) + ' ' + money(amt));
+    } else {
+      S.income.push({ id: uid(), ts: now, date: date, type: 'other', amount: amt, month: monthOf(date), note: note, acct: a.id, status: 'cleared' });
+      logFix(key, 'Added missing money in ' + money(amt));
     }
-    S.checkins = S.checkins.filter(function(c){ return c.date !== t; });
-    S.checkins.push({ date: t, checking: chk, venmo: ven, debts: balances, totalDebt: totalDebt() });
-    save(); go('home'); toast('Check-in saved.');
+    save(); render(); toast('Added.');
+    return;
+  }
+  if (kind === 'aadj'){
+    if (!(amt > 0)) return toast('Enter an amount.');
+    if (!note) return toast('Add a note saying what this was.');
+    var signed = f.dir.value === 'sub' ? -amt : amt;
+    S.acctAdj.push({ id: uid(), ts: now, acct: a.id, date: t, amount: signed, note: note, status: 'cleared' });
+    logFix(key, 'Adjustment ' + (signed > 0 ? '+' : '') + money(signed) + ': ' + note);
+    save(); render(); toast('Adjustment posted.');
+    return;
+  }
+  if (kind === 'xfer'){
+    if (!(amt > 0)) return toast('Enter an amount.');
+    if (f.from.value === f.to.value) return toast('Pick two different accounts.');
+    S.transfers.push({ id: uid(), ts: now, date: date, from: f.from.value, to: f.to.value, amount: amt, note: note, status: 'cleared' });
+    save(); render(); toast('Transfer saved.');
+    return;
+  }
+  var db = S.debts[findIdx(S.debts, f.dataset.id)], dkey = 'd:' + f.dataset.id;
+  if (kind === 'dcmp'){
+    var dact = num(f.actual.value); if (isNaN(dact)) return toast('Enter the balance from your statement or app.');
+    rd[dkey] = { actual: dact };
+    render(); return;
+  }
+  if (kind === 'drecon'){
+    var dbal = debtBalance(db);
+    history('debt', db.id, db.name, dbal, rd[dkey].actual, 0, note);
+    db.reconciled = t; delete rd[dkey];
+    save(); render(); toast(db.name + ' reconciled.');
+    return;
+  }
+  if (kind === 'dpost'){
+    var tracked = debtBalance(db), actual = rd[dkey].actual, diff = r2(actual - tracked), reason = f.reason.value, label;
+    if (diff < 0 && reason === 'payment'){
+      S.debtEntries.push({ id: uid(), ts: now, debtId: db.id, date: t, kind: 'payment', amount: -diff, note: note || 'Found while reconciling', fromAcct: f.from.value, status: 'cleared' });
+      label = 'Missing payment ' + money(-diff);
+    } else {
+      S.debtEntries.push({ id: uid(), ts: now, debtId: db.id, date: t, kind: 'adjust', reason: reason, amount: diff, note: note, status: 'cleared' });
+      label = ({ interest: 'Interest', charge: 'New charge', other: 'Other adjustment' }[reason]) + ' ' + (diff > 0 ? '+' : '') + money(diff);
+    }
+    history('debt', db.id, db.name, tracked, actual, diff, label + (note ? ': ' + note : ''));
+    db.reconciled = t; delete rd[dkey];
+    save(); render();
+    toast(reason === 'charge' ? 'Posted. A new charge breaks rule 1. Pay it off now.' : db.name + ' reconciled.');
   }
 });
 
